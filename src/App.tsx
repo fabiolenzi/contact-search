@@ -7,6 +7,13 @@ interface QSA {
   qual: string
 }
 
+interface company {
+  municipio: string
+  telefone: string
+  uf: string
+  qsa: QSA[]
+}
+
 function App(): JSX.Element {
   const [selectedFile, setSelectedFile] = useState<File | undefined>(undefined)
   const [sheetLines, setSheetLines] = useState<number>(0)
@@ -57,15 +64,27 @@ function App(): JSX.Element {
   const fetchData = async (cnpj: string, sheetLine: number): Promise<string[]> => {
     try {
       const response = await fetch(`https://receitaws.com.br/v1/cnpj/${cnpj.replace(/\D/g, '')}`)
-      const data = await response.json()
-      const name = (data.qsa as QSA[]).find((person) => person.qual == '49-Sócio-Administrador')
-        ?.nome
+      const data: company = await response.json()
+      const name = getName(data.qsa as QSA[])
+      const contact = getContact(data)
       setLog((oldLog) => [...oldLog, `Sucesso ao buscar dados na linha ${sheetLine}.`])
-      return [name, data.telefone]
+      return [name, contact]
     } catch (_) {
       setLog((oldLog) => [...oldLog, `Erro ao buscar dados na linha ${sheetLine}!`])
       return []
     }
+  }
+
+  const getName = (qsa: QSA[]): string => {
+    const firstQual = '49-Sócio-Administrador'
+    const secondQual = '05-Administrador'
+
+    const name = qsa.find((person) => person.qual == firstQual || person.qual == secondQual)?.nome
+    return name ?? ''
+  }
+
+  const getContact = (data: company): string => {
+    return `${data.telefone} - ${data.municipio}/${data.uf}`
   }
 
   const getData = async (): Promise<void> => {
