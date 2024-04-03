@@ -22,6 +22,9 @@ function App(): JSX.Element {
   const workbook = useRef<Excel.Workbook>(new Excel.Workbook())
   const nameColumn = useRef<HTMLInputElement | null>(null)
   const telColumn = useRef<HTMLInputElement | null>(null)
+  const [hasFilter, setHasFilter] = useState(false);
+  const filterColumn = useRef<HTMLInputElement | null>(null)
+  const filterValue = useRef<HTMLInputElement | null>(null)
 
   const CNPJ_REGEX = /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/
 
@@ -45,15 +48,17 @@ function App(): JSX.Element {
       )
       const cnpj: string | undefined = cnpjCell?.toString()
       if (cnpj) {
+        const amount = getValueToFilter(row)
+        if (hasFilter && amount && filterValue.current?.valueAsNumber && amount < filterValue.current?.valueAsNumber) {
+          setLog((oldLog) => [...oldLog, `Linha ${rowNumber} não atinge valor mínimo.`])
+          await sleep(0.5)
+        } else {
         const response = await fetchData(cnpj, rowNumber)
         if (workbook.current.getWorksheet(1)) {
-          if (!nameColumn.current?.value || !telColumn.current?.value) return
-
-          row.getCell(nameColumn.current.value.toUpperCase()).value = response[0]
-          row.getCell(telColumn.current.value.toUpperCase()).value = response[1]
-          row.commit()
+          writeData(row, response)
         }
         await sleep(20)
+      }
       } else {
         setLog((oldLog) => [...oldLog, `CNPJ não encontrado na linha ${rowNumber}.`])
         await sleep(0.5)
@@ -74,6 +79,30 @@ function App(): JSX.Element {
       return []
     }
   }
+
+  const writeData = (row: Excel.Row, data: string[]) => {
+    if (!nameColumn.current?.value || !telColumn.current?.value) return
+
+    const nameCol = nameColumn.current.value.toUpperCase();
+    const telCol = telColumn.current.value.toUpperCase();
+
+    if (nameCol === telCol) {
+      row.getCell(nameCol).value = data.join(' - ');
+    } else {
+      row.getCell(nameCol).value = data[0]
+      row.getCell(telCol).value = data[1]
+    }
+
+    row.commit()
+  }
+
+  const getValueToFilter = (row: Excel.Row): number | null => {
+    if (!hasFilter || !filterColumn.current?.value) {
+      return null;
+    }
+
+    return row.getCell(filterColumn.current.value.toUpperCase()).value as number ?? null;
+  } 
 
   const getName = (qsa: QSA[]): string => {
     const firstQual = '49-Sócio-Administrador'
@@ -136,8 +165,36 @@ function App(): JSX.Element {
           />
         </div>
         <div className="column-field">
-          <label htmlFor="">Coluna para telefone:</label>
+          <label htmlFor="tel">Coluna para telefone:</label>
           <input ref={telColumn} type="text" name="tel" id="tel" />
+        </div>
+      </div>
+      <div className="fields">
+        <div className="column-field">
+          <label htmlFor="hasFilter">Filtrar valor mínimo?</label>
+          <input checked={hasFilter}  type="checkbox" name="hasFilter" id="hasFilter" onChange={() => {setHasFilter(!hasFilter)}} />
+        </div>
+        <div className="column-field">
+          <label htmlFor="filterColumn">Coluna do filtro</label>
+           <input
+            ref={filterColumn}
+            type="text"
+            name="filterColumn"
+            id="filterColumn"
+            maxLength={2}
+            pattern="[A-Za-z]"
+            disabled={!hasFilter}
+          />
+        </div>
+        <div className="amount-field">
+          <label htmlFor="filterValue">Valor mínimo</label>
+           <input
+            ref={filterValue}
+            type="number"
+            name="filterValue"
+            id="filterValue"
+            disabled={!hasFilter}
+          />
         </div>
       </div>
       <div className="buttons">

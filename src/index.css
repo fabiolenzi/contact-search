@@ -48,14 +48,18 @@ h1 {
   margin: 10px auto;
 }
 
-.column-field {
+.column-field, .amount-field {
   display: flex;
   gap: 5px;
 }
 
 .column-field > input {
-  text-transform:uppercase;
+  text-transform: uppercase;
   width: 30px;
+}
+
+.amount-field > input {
+  width: 100px;
 }
 
 .buttons {
