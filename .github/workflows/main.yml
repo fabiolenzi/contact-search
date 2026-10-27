@@ -31,7 +31,7 @@ jobs:
       - name: Checkout preview branch
         uses: actions/checkout@v4
         with:
-          ref: v0.2
+          ref: ${{ github.ref == 'refs/heads/v0.2' && github.sha || 'v0.2' }}
           path: preview-source
 
       - name: Set up Node
