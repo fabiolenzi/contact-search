@@ -18,6 +18,7 @@ interface company {
 interface SavedSettings {
   nameColumn: string
   telColumn: string
+  phoneMode: 'joined' | 'split'
   cityColumn: string
   hasFilter: boolean
   filterColumn: string
@@ -28,6 +29,7 @@ const SETTINGS_KEY = 'contact-search-settings'
 const DEFAULT_SETTINGS: SavedSettings = {
   nameColumn: '',
   telColumn: '',
+  phoneMode: 'split',
   cityColumn: '',
   hasFilter: false,
   filterColumn: '',
@@ -47,6 +49,7 @@ function App(): JSX.Element {
   const [selectedFile, setSelectedFile] = useState<File | undefined>(undefined)
   const [sheetLines, setSheetLines] = useState<number>(0)
   const [log, setLog] = useState<string[]>([])
+  const [nextRequestIn, setNextRequestIn] = useState<number | null>(null)
   const [settings, setSettings] = useState<SavedSettings>(readSettings)
 
   const workbook = useRef<Excel.Workbook>(new Excel.Workbook())
@@ -65,13 +68,33 @@ function App(): JSX.Element {
     return new Promise((resolve) => setTimeout(resolve, seconds * 1000))
   }
 
+  const waitForNextRequest = async (delaySeconds = 20): Promise<void> => {
+    for (let seconds = delaySeconds; seconds > 0; seconds -= 1) {
+      setNextRequestIn(seconds)
+      await sleep(1)
+    }
+    setNextRequestIn(null)
+  }
+
+  const getRetryDelay = (retryAfter: string | null): number => {
+    if (!retryAfter) return 20
+
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds)) return Math.max(1, Math.ceil(seconds))
+
+    const retryAt = Date.parse(retryAfter)
+    if (Number.isNaN(retryAt)) return 20
+    return Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))
+  }
+
   const processSheet = async (): Promise<void> => {
     await getData()
     const worksheet = workbook.current.getWorksheet(1)
     if (!worksheet) return
     setSheetLines(worksheet.rowCount)
 
-    for (const [index, row] of (worksheet.getRows(1, worksheet.rowCount) as Excel.Row[]).entries()) {
+    const rows = worksheet.getRows(1, worksheet.rowCount) as Excel.Row[]
+    for (const [index, row] of rows.entries()) {
       const rowNumber = index + 1
       const cnpjCell = (row.values as Excel.CellValue[]).find((value: Excel.CellValue) =>
         CNPJ_REGEX.test(value?.toString() || '')
@@ -86,7 +109,16 @@ function App(): JSX.Element {
         } else {
           const response = await fetchData(cnpj, rowNumber)
           writeData(row, response)
-          await sleep(20)
+          const hasNextRequest = rows.slice(index + 1).some((nextRow) => {
+            const nextCnpj = (nextRow.values as Excel.CellValue[]).find((value: Excel.CellValue) =>
+              CNPJ_REGEX.test(value?.toString() || '')
+            )
+            if (!nextCnpj) return false
+
+            const nextAmount = getValueToFilter(nextRow)
+            return !(settings.hasFilter && nextAmount !== null && settings.filterValue !== '' && nextAmount < minimumValue)
+          })
+          if (hasNextRequest) await waitForNextRequest()
       }
       } else {
         setLog((oldLog) => [...oldLog, `CNPJ não encontrado na linha ${rowNumber}.`])
@@ -96,29 +128,98 @@ function App(): JSX.Element {
   }
 
   const fetchData = async (cnpj: string, sheetLine: number): Promise<string[]> => {
-    try {
-      const response = await fetch(`https://receitaws.com.br/v1/cnpj/${cnpj.replace(/\D/g, '')}`)
-      const data: company = await response.json()
-      const name = getName(data.qsa as QSA[])
-      setLog((oldLog) => [...oldLog, `Sucesso ao buscar dados na linha ${sheetLine}.`])
-      return [name, data.telefone ?? '', data.municipio ?? '']
-    } catch (_) {
-      setLog((oldLog) => [...oldLog, `Erro ao buscar dados na linha ${sheetLine}!`])
-      return []
+    for (let retry = 0; retry <= 2; retry += 1) {
+      try {
+        const response = await fetch(`https://receitaws.com.br/v1/cnpj/${cnpj.replace(/\D/g, '')}`)
+        if (response.status === 429) {
+          if (retry === 2) {
+            setLog((oldLog) => [...oldLog, `Erro ao buscar dados na linha ${sheetLine}: HTTP 429 após 3 tentativas.`])
+            return []
+          }
+
+          const delay = getRetryDelay(response.headers.get('Retry-After'))
+          setLog((oldLog) => [...oldLog, `Limite de requisições na linha ${sheetLine}. Nova tentativa ${retry + 1}/2 em ${delay}s.`])
+          await waitForNextRequest(delay)
+          continue
+        }
+
+        const data: company = await response.json()
+        const name = getName(data.qsa as QSA[])
+        setLog((oldLog) => [...oldLog, `Sucesso ao buscar dados na linha ${sheetLine}.`])
+        return [name, data.telefone ?? '', data.municipio ?? '']
+      } catch (_) {
+        setLog((oldLog) => [...oldLog, `Erro ao buscar dados na linha ${sheetLine}!`])
+        return []
+      }
     }
+
+    return []
   }
 
   const writeData = (row: Excel.Row, data: string[]) => {
     if (data.length < 3 || !settings.nameColumn || !settings.telColumn || !settings.cityColumn) return
 
+    const phoneNumbers = data[1].split('/').map((phone) => phone.trim()).filter(Boolean)
+    const phoneValue = settings.phoneMode === 'split'
+      ? phoneNumbers[0] ?? ''
+      : data[1].trim()
     const columns = [
       settings.nameColumn,
       settings.telColumn,
       settings.cityColumn,
     ]
-    writeGroupedData(row, data, columns)
+    writeGroupedData(row, [data[0], phoneValue, data[2]], columns)
+
+    if (settings.phoneMode === 'split' && phoneNumbers.length > 1) {
+      const reservedColumns = new Set(
+        [settings.nameColumn, settings.telColumn, settings.cityColumn]
+          .map((column) => column.toUpperCase())
+      )
+      if (settings.hasFilter && settings.filterColumn) {
+        reservedColumns.add(settings.filterColumn.toUpperCase())
+      }
+      const firstEmptyColumn = columnLettersToNumber(settings.telColumn.toUpperCase()) + 1
+      writePhonesToEmptyColumns(row, phoneNumbers.slice(1), firstEmptyColumn, reservedColumns)
+    }
 
     row.commit()
+  }
+
+  const writePhonesToEmptyColumns = (
+    row: Excel.Row,
+    phones: string[],
+    startColumn: number,
+    reservedColumns: Set<string>,
+  ) => {
+    let columnNumber = startColumn
+    for (const phone of phones) {
+      while (columnNumber <= 16384) {
+        const column = columnNumberToLetters(columnNumber)
+        const cell = row.getCell(columnNumber)
+        columnNumber += 1
+
+        if (reservedColumns.has(column)) continue
+        if (cell.value !== null && cell.value !== undefined && cell.value !== '') continue
+
+        cell.value = phone
+        break
+      }
+    }
+  }
+
+  const columnLettersToNumber = (letters: string): number => {
+    return letters.split('').reduce((number, letter) => number * 26 + letter.charCodeAt(0) - 64, 0)
+  }
+
+  const columnNumberToLetters = (columnNumber: number): string => {
+    let number = columnNumber
+    let letters = ''
+    while (number > 0) {
+      const remainder = (number - 1) % 26
+      letters = String.fromCharCode(65 + remainder) + letters
+      number = Math.floor((number - 1) / 26)
+    }
+    return letters
   }
 
   const writeGroupedData = (row: Excel.Row, data: string[], columns: string[]) => {
@@ -235,6 +336,32 @@ function App(): JSX.Element {
           </div>
         </div>
 
+        <fieldset className="phone-mode-options">
+          <legend>Como salvar vários telefones?</legend>
+          <label htmlFor="phoneModeJoined">
+            <input
+              checked={settings.phoneMode === 'joined'}
+              id="phoneModeJoined"
+              name="phoneMode"
+              onChange={() => setSettings({ ...settings, phoneMode: 'joined' })}
+              type="radio"
+              value="joined"
+            />
+            <span><strong>Manter juntos</strong><small>Todos os números em uma célula.</small></span>
+          </label>
+          <label htmlFor="phoneModeSplit">
+            <input
+              checked={settings.phoneMode === 'split'}
+              id="phoneModeSplit"
+              name="phoneMode"
+              onChange={() => setSettings({ ...settings, phoneMode: 'split' })}
+              type="radio"
+              value="split"
+            />
+            <span><strong>Separar em células</strong><small>Um número por coluna vazia, a partir da próxima.</small></span>
+          </label>
+        </fieldset>
+
         <div className={`filter-panel${settings.hasFilter ? ' is-enabled' : ''}`}>
           <label className="filter-toggle" htmlFor="hasFilter">
             <input checked={settings.hasFilter} type="checkbox" name="hasFilter" id="hasFilter" onChange={(event) => setSettings({ ...settings, hasFilter: event.target.checked })} />
@@ -262,6 +389,13 @@ function App(): JSX.Element {
       {(sheetLines > 0 || log.length > 0) && (
         <section className="results-card" aria-label="Atividade">
           <div className="results-heading"><div><span className="eyebrow">ACOMPANHAMENTO</span><h2>Atividade recente</h2></div>{sheetLines > 0 && <span className="progress-count">{log.length} <span>/ {sheetLines} linhas</span></span>}</div>
+          {nextRequestIn !== null && (
+            <div className="request-countdown" role="status" aria-live="polite">
+              <span className="countdown-pulse" aria-hidden="true" />
+              <span>Próxima consulta em</span>
+              <strong>{nextRequestIn}s</strong>
+            </div>
+          )}
           <Log entries={log} />
         </section>
       )}
